@@ -463,6 +463,12 @@ interface NewTaskState {
   editorReady: boolean
   path: string
   pathIsNew: boolean
+  /** 当前输入区是否为「工作任务」模式 */
+  flowMode: boolean
+  /** 工作任务模式特征按钮（general-agent-*）可见数 */
+  flowButtons: number
+  /** 普通对话模式特征按钮（skill_bar_button_*）可见数 */
+  skillButtons: number
   hasText: boolean
   hasAttachment: boolean
   href: string
@@ -486,13 +492,27 @@ const NEW_TASK_STATE = `(() => {
   const editor = document.querySelector('.tiptap.ProseMirror')
     || document.querySelector('[data-testid="chat_input_input"] [contenteditable="true"]');
   const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 };
+  const countVisible = (sel) => {
+    let n = 0;
+    for (const el of document.querySelectorAll(sel)) if (visible(el)) n++;
+    return n;
+  };
   const path = location.pathname.replace(/\\/+$/, '');
   const guide = document.querySelector('[data-testid="flow_chat_guidance_page"]');
-  const guideVisible = !!guide && guide.getBoundingClientRect().width > 0;
+  const guideVisible = !!guide && visible(guide);
+  // 实机验证（2026-11-20）：普通对话与工作任务的新对话页 URL 同为 /chat，
+  // flow_chat_guidance_page 在两种模式的 DOM 里都存在，均不可用作模式区分。
+  // 真实差异：任务模式输入区带 general-agent-plugin-button / general-agent-skill-button，
+  // 普通对话模式则是 skill_bar_button_* 技能条。
+  const flowButtons = countVisible('[data-testid="general-agent-plugin-button"], [data-testid="general-agent-skill-button"]');
+  const skillButtons = countVisible('[data-testid^="skill_bar_button_"]');
   return {
     editorReady: !!editor && !!editor.isContentEditable && visible(editor),
     path: location.pathname,
     pathIsNew: path === '/chat' || guideVisible,
+    flowMode: flowButtons > 0,
+    flowButtons,
+    skillButtons,
     hasText: !!(editor && (editor.textContent || '').trim().length),
     hasAttachment: !!document.querySelector('[data-testid="attachment_area"], [data-testid="attachment_file_item"]'),
     href: location.href
@@ -613,14 +633,18 @@ export class AttachmentManager {
 
     const state = await evalState()
     if (state) this.dlog(jobId, accountId, `[new-task] state ${JSON.stringify(state)}`)
-    if (state && state.editorReady && state.pathIsNew) {
-      this.dlog(jobId, accountId, '[new-task] already on new-task page, skip click')
+    // 已处于「工作任务」模式：不重复点击，避免清空用户正在编辑的内容。
+    // 不能只看 URL——普通对话与工作任务的新对话页同为 /chat（实机验证），
+    // 必须用输入区特征（general-agent-* 按钮可见）确认当前确实是任务模式
+    if (state && state.editorReady && state.flowMode) {
+      this.dlog(jobId, accountId, '[new-task] already in work-task mode, skip click')
       return
     }
     if (state && state.hasText) {
       this.dlog(jobId, accountId, '[new-task] current page has draft text')
     }
-    if (state && !state.pathIsNew && (state.hasText || state.hasAttachment)) {
+    // 普通对话新页 / 会话页需要切换模式；两种页面有未发送内容时切换会丢失，直接报错
+    if (state && (state.hasText || state.hasAttachment)) {
       throw new Error('未能切换到新工作任务：当前对话有未发送内容，请先发送或清空后再同步')
     }
 
@@ -702,16 +726,21 @@ export class AttachmentManager {
     }
 
     const deadline = Date.now() + NEW_TASK_TIMEOUT
+    let lastState: NewTaskState | null = null
     while (Date.now() < deadline) {
       if (signal.aborted) throw new Error('已取消')
       if (wc.isDestroyed()) throw new Error('账号页面已关闭，无法切换新工作任务')
       await delay(200)
       const s = await evalState()
-      if (s && s.editorReady) {
-        this.dlog(jobId, accountId, `[new-task] editor ready at ${s.path}`)
+      if (s) lastState = s
+      // 编辑器就绪且确实处于任务模式。普通对话页编辑器也一直 ready，
+      // 只看 editorReady 会把点击失败误判为切换成功
+      if (s && s.editorReady && s.flowMode) {
+        this.dlog(jobId, accountId, `[new-task] flow editor ready at ${s.path}`)
         return
       }
     }
+    this.dlog(jobId, accountId, `[new-task] wait timeout, lastState=${JSON.stringify(lastState)}`)
     throw new Error(
       `未能切换到新工作任务：等待任务页输入区就绪超时（诊断日志：${this.logFile}）`
     )
