@@ -1,0 +1,51 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile main / preload / renderer
+        run: npm run build
+
+      # 用 electron-builder 直接打包，--publish never 避免 CI 自动触发发布流程
+      - name: Package NSIS installer
+        run: npx electron-builder --win --config electron-builder.config.js --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+          if-no-files-found: error
+
+      - name: Attach installer to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.exe
+          generate_release_notes: true
