@@ -26,7 +26,6 @@ export class ViewManager {
   private tabs: string[] = [] // 打开的账号 id，按打开顺序
   private activeId: string | null = null
   private views = new Map<string, WebContentsView>()
-  private tempViews = new Set<WebContentsView>()
   private lastUsed = new Map<string, number>()
   private bounds = { x: 0, y: 0, width: 0, height: 0 }
 
@@ -51,11 +50,6 @@ export class ViewManager {
   }
 
   /** 面板产物下载预先登记的文件名（下载一次消费一次） */
-  private stagedNames = new Map<string, string>()
-
-  stageDownloadName(accountId: string, name: string): void {
-    this.stagedNames.set(accountId, name)
-  }
 
   /** 下载处理：自动保存到系统「下载」目录，重名自动编号，并向前端推送进度 */
   private attachDownloadHandler(ses: Session, accountId: string): void {
@@ -64,23 +58,12 @@ export class ViewManager {
     flag.__dlAttached = true
 
     ses.on('will-download', (_e, item) => {
+      // 页面内发起的下载（面板产物下载已改为主进程流式下载，不经过这里）
+      console.log(
+        `[download] will-download total=${item.getTotalBytes()} mime=${item.getMimeType()}`
+      )
       const dir = app.getPath('downloads')
-      // 面板产物下载会预先登记文件名（对齐豆包原生命名），优先使用
-      const staged = this.stagedNames.get(accountId)
-      this.stagedNames.delete(accountId)
-      let base = staged || item.getFilename() || `download-${Date.now()}`
-      // CDN 模板 URL 的路径扩展名不可信（对象名 .jpeg 实际输出 png 字节），
-      // 用下载真实返回的 MIME 纠正面板登记的扩展名
-      if (staged) {
-        const mime = item.getMimeType().toLowerCase()
-        const sub = mime.split('/')[1]
-        if ((mime.startsWith('image/') || mime.startsWith('video/')) && sub) {
-          const ext = sub === 'jpeg' ? '.jpeg' : '.' + sub.replace(/[^a-z0-9]/g, '')
-          if (ext.length > 1 && !base.toLowerCase().endsWith(ext)) {
-            base = base.replace(/\.[a-z0-9]{2,5}$/i, '') + ext
-          }
-        }
-      }
+      let base = item.getFilename() || `download-${Date.now()}`
       const ext = path.extname(base)
       const stem = path.basename(base, ext)
       let savePath = path.join(dir, base)
@@ -103,11 +86,22 @@ export class ViewManager {
       }
 
       payload('started')
+      let lastLog = Date.now()
       item.on('updated', (_ev, state) => {
         if (state === 'progressing' && !item.isPaused()) payload('progressing')
+        // 调试：每秒抽样一次真实进度，确认 total/received 是否符合预期
+        if (Date.now() - lastLog >= 1000) {
+          lastLog = Date.now()
+          console.log(
+            `[download] ${state} received=${item.getReceivedBytes()} total=${item.getTotalBytes()}`
+          )
+        }
       })
       item.once('done', (_ev, state) => {
         payload(state === 'completed' ? 'done' : 'failed')
+        console.log(
+          `[download] done state=${state} received=${item.getReceivedBytes()} total=${item.getTotalBytes()}`
+        )
       })
     })
   }
@@ -236,26 +230,6 @@ export class ViewManager {
     if (this.activeId !== id) return null
     const view = this.views.get(id)
     return view ? view.webContents : null
-  }
-
-  /** 获取账号的 webContents：优先已有视图，否则建临时隐藏视图（用于触发下载，15s 后销毁） */
-  webContentsFor(id: string): Electron.WebContents | null {
-    const v = this.views.get(id)
-    if (v) return v.webContents
-    if (!this.store.accounts.some((a) => a.id === id)) return null
-    const tmp = new WebContentsView({
-      webPreferences: { session: this.sessionFor(id), contextIsolation: true }
-    })
-    this.tempViews.add(tmp)
-    setTimeout(() => {
-      try {
-        tmp.webContents.close()
-      } catch {
-        // ignore
-      }
-      this.tempViews.delete(tmp)
-    }, 15_000)
-    return tmp.webContents
   }
 
   tabsState(): { tabs: { id: string; name: string; color: string }[]; activeId: string | null } {

@@ -246,6 +246,29 @@ export default function App() {
     () => (artFilter === 'all' ? artifacts : artifacts.filter((a) => a.accountId === artFilter)),
     [artifacts, artFilter]
   )
+
+  // 调试用：产物面板每次变化都在 DevTools 控制台打印一次完整数据，便于核对字段
+  useEffect(() => {
+    const list = artifacts
+    console.log(`[产物面板] 列表变化 ${list.length} 条`, list)
+    console.table(
+      list.map((a) => ({
+        id: a.id,
+        账号: accMap.get(a.accountId)?.name ?? a.accountId,
+        accountId: a.accountId,
+        kind: a.kind,
+        文件名: a.filename,
+        大小: a.size,
+        时间: new Date(a.time).toLocaleString(),
+        convId: a.convId ?? '',
+        prompt: a.prompt ?? '',
+        thumb: a.thumb ? `${a.thumb.length} chars` : '',
+        thumbSrc: a.thumbSrc ?? '',
+        url: a.url
+      }))
+    )
+  }, [artifacts, accMap])
+
   // 当前账号正在同步的任务：标题栏按钮同步显示进度，避免面板收起时看不到反馈
   const syncJob = attaches.find(
     (a) =>
@@ -670,7 +693,7 @@ export default function App() {
                       </div>
                     ) : (
                       <VideoThumb
-                        src={`artifactstream://v/${a.id}`}
+                        src={`artifactstream://v/${a.id}?thumb=1`}
                         name={a.filename}
                         onOpen={() => openPreview(a)}
                       />
@@ -749,7 +772,8 @@ export default function App() {
           )
         })}
         {downloads.map((d) => {
-          const pct = d.total > 0 ? Math.round((d.received / d.total) * 100) : 0
+          const known = d.total > 0
+          const pct = known ? Math.round((d.received / d.total) * 100) : 0
           return (
             <div
               key={d.savePath}
@@ -769,7 +793,7 @@ export default function App() {
                 </span>
                 <span className="toast-name">{d.filename}</span>
                 <span className="toast-meta">
-                  {d.status === 'progressing' && `${pct}%`}
+                  {d.status === 'progressing' && (known ? `${pct}%` : `${fmtBytes(d.received)}`)}
                   {d.status === 'started' && '开始下载…'}
                   {d.status === 'done' && '已完成'}
                   {d.status === 'failed' && '下载失败'}
@@ -777,12 +801,14 @@ export default function App() {
               </div>
               {d.status !== 'done' && d.status !== 'failed' && (
                 <>
-                  <div className="toast-bar">
-                    <i style={{ width: `${pct}%` }} />
+                  <div className={`toast-bar${known ? '' : ' indeterminate'}`}>
+                    <i style={known ? { width: `${pct}%` } : undefined} />
                   </div>
                   <div className="toast-foot">
                     <span className="toast-bytes">
-                      {fmtBytes(d.received)} / {fmtBytes(d.total)}
+                      {known
+                        ? `${fmtBytes(d.received)} / ${fmtBytes(d.total)}`
+                        : `${fmtBytes(d.received)} / 总长未知`}
                     </span>
                   </div>
                 </>

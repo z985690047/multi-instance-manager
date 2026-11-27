@@ -8,9 +8,14 @@ import { ArtifactManager } from './artifacts'
 import { AttachmentManager } from './attach'
 import { IS_MAC } from './platform'
 
-declare module 'electron' {
-  interface App {
-    isQuitting?: boolean
+// electron.d.ts 里 App 是全局命名空间 Electron 下的接口（模块 'electron' 只是
+// `export = Electron.CrossProcessExports`），所以必须合并到 Electron.App，
+// 不能在模块里重新声明 interface App（会与已导出的 type App 别名重名）。
+declare global {
+  namespace Electron {
+    interface App {
+      isQuitting?: boolean
+    }
   }
 }
 
@@ -116,9 +121,7 @@ function registerIpc(): void {
   ipcMain.handle('tabs:list', () => manager.tabsState())
   ipcMain.handle('view:overlay', (_e, hidden: boolean) => manager.setOverlay(hidden))
   ipcMain.handle('artifacts:list', () => artifacts.list())
-  ipcMain.handle('artifacts:download', (_e, id: string) =>
-    artifacts.download(id, (accId) => manager.webContentsFor(accId))
-  )
+  ipcMain.handle('artifacts:download', (_e, id: string) => artifacts.download(id))
   ipcMain.on('artifacts:clear', () => artifacts.clear())
   ipcMain.handle('attach:from-url', (_e, p: { accountId: string; url: string }) =>
     attachment.attachFromUrl(p.accountId, p.url)
@@ -162,7 +165,6 @@ if (!gotLock) {
     win = createWindow()
     manager = new ViewManager(win, store, push)
     artifacts = new ArtifactManager(push, app.getPath('userData'))
-    artifacts.onDownloadName = (acc, name) => manager.stageDownloadName(acc, name)
     manager.onViewSession = (ses, id) => artifacts.attach(ses, id)
     manager.onViewCreated = (wc, id) => artifacts.attachView(wc, id)
     attachment = new AttachmentManager(
@@ -179,10 +181,24 @@ if (!gotLock) {
         const item = artifacts.get(id)
         dlog(`req ${req.url} -> ${id} ${item ? item.kind : 'NOT FOUND'}`)
         if (!item) return new Response('not found', { status: 404 })
+        // 视频：主进程单条流下载到本地缓存，预览与下载共用同一条流。
+        // 直接让渲染进程直连上游时，<video> 缓冲够了就停止读取，未消费的响应体会占满
+        // HTTP/2 连接级流控窗口，同域后续请求（预览续读、下载）连响应头都拿不到，
+        // 最终 net::ERR_HTTP2_PROTOCOL_ERROR（探针已验证）。
+        if (item.kind === 'video') {
+          // ?thumb=1 是列表首帧封面：只取文件头，不触发整段缓存
+          const thumb = new URL(req.url).searchParams.get('thumb') === '1'
+          const res = thumb
+            ? await artifacts.serveThumb(item)
+            : await artifacts.serveVideo(item, req.headers.get('range'))
+          status = res.status
+          dlog(
+            `${thumb ? 'thumb' : 'video cache'} status=${status} range=${req.headers.get('range') ?? 'none'}`
+          )
+          return res
+        }
         const ses = session.fromPartition(`persist:doubao_${item.accountId}`)
         const headers: Record<string, string> = {}
-        const range = req.headers.get('range')
-        if (range) headers['range'] = range
         const res = await ses.fetch(item.url, { headers })
         status = res.status
         dlog(`upstream status=${status} ct=${res.headers.get('content-type')} cl=${res.headers.get('content-length')}`)

@@ -1,4 +1,4 @@
-import { app, net, type WebContents } from 'electron'
+import { app, net, session, type WebContents } from 'electron'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
@@ -498,18 +498,15 @@ const NEW_TASK_STATE = `(() => {
     return n;
   };
   const path = location.pathname.replace(/\\/+$/, '');
-  const guide = document.querySelector('[data-testid="flow_chat_guidance_page"]');
-  const guideVisible = !!guide && visible(guide);
-  // 实机验证（2026-11-20）：普通对话与工作任务的新对话页 URL 同为 /chat，
-  // flow_chat_guidance_page 在两种模式的 DOM 里都存在，均不可用作模式区分。
-  // 真实差异：任务模式输入区带 general-agent-plugin-button / general-agent-skill-button，
-  // 普通对话模式则是 skill_bar_button_* 技能条。
+  // 实机验证（2026-11-25）：已有工作任务对话的 URL 是 /chat/<会话id>，输入区同样是
+  // flowMode（general-agent-*），所以「是否新任务页」只能看 URL，不能看输入区特征。
+  // flow_chat_guidance_page 在两种对话页的 DOM 里都存在，也不能作为判据。
   const flowButtons = countVisible('[data-testid="general-agent-plugin-button"], [data-testid="general-agent-skill-button"]');
   const skillButtons = countVisible('[data-testid^="skill_bar_button_"]');
   return {
     editorReady: !!editor && !!editor.isContentEditable && visible(editor),
     path: location.pathname,
-    pathIsNew: path === '/chat' || guideVisible,
+    pathIsNew: path === '/chat',
     flowMode: flowButtons > 0,
     flowButtons,
     skillButtons,
@@ -633,18 +630,26 @@ export class AttachmentManager {
 
     const state = await evalState()
     if (state) this.dlog(jobId, accountId, `[new-task] state ${JSON.stringify(state)}`)
-    // 已处于「工作任务」模式：不重复点击，避免清空用户正在编辑的内容。
-    // 不能只看 URL——普通对话与工作任务的新对话页同为 /chat（实机验证），
-    // 必须用输入区特征（general-agent-* 按钮可见）确认当前确实是任务模式
-    if (state && state.editorReady && state.flowMode) {
-      this.dlog(jobId, accountId, '[new-task] already in work-task mode, skip click')
+    // 只有「新任务页（/chat，不带会话 id）+ 任务模式 + 编辑器就绪」才算已就绪。
+    // 已有工作任务对话（/chat/<会话id>）同样是 flowMode，实机日志已证实：
+    // 旧判据在这里直接 skip click，文件被注入了当前已有对话。
+    if (state && state.editorReady && state.flowMode && state.pathIsNew) {
+      this.dlog(jobId, accountId, '[new-task] already on new-task page in work-task mode, skip click')
       return
+    }
+    if (state && state.flowMode && !state.pathIsNew) {
+      this.dlog(
+        jobId,
+        accountId,
+        `[new-task] 当前是已有对话 ${state.path}，需要点「新工作任务」另开新对话`
+      )
     }
     if (state && state.hasText) {
       this.dlog(jobId, accountId, '[new-task] current page has draft text')
     }
-    // 普通对话新页 / 会话页需要切换模式；两种页面有未发送内容时切换会丢失，直接报错
-    if (state && (state.hasText || state.hasAttachment)) {
+    // 新任务页上有未发送内容时，点击切换会丢失草稿，直接报错；
+    // 已有对话页里的附件属于会话历史，不能据此阻止另开新任务
+    if (state && (state.hasText || (state.hasAttachment && state.pathIsNew))) {
       throw new Error('未能切换到新工作任务：当前对话有未发送内容，请先发送或清空后再同步')
     }
 
@@ -733,16 +738,19 @@ export class AttachmentManager {
       await delay(200)
       const s = await evalState()
       if (s) lastState = s
-      // 编辑器就绪且确实处于任务模式。普通对话页编辑器也一直 ready，
-      // 只看 editorReady 会把点击失败误判为切换成功
-      if (s && s.editorReady && s.flowMode) {
+      // 编辑器就绪 + 任务模式 + URL 已经变成新任务页（/chat 且不带会话 id）。
+      // 普通对话页编辑器也一直 ready；已有对话页同样是 flowMode，
+      // 少判任何一个都会把「点击没生效」误判为切换成功。
+      if (s && s.editorReady && s.flowMode && s.pathIsNew) {
         this.dlog(jobId, accountId, `[new-task] flow editor ready at ${s.path}`)
         return
       }
     }
     this.dlog(jobId, accountId, `[new-task] wait timeout, lastState=${JSON.stringify(lastState)}`)
     throw new Error(
-      `未能切换到新工作任务：等待任务页输入区就绪超时（诊断日志：${this.logFile}）`
+      `未能切换到新工作任务：点击后仍未进入新任务页（当前 ${
+        lastState ? lastState.path : '未知'
+      }，应为 /chat；诊断日志：${this.logFile}）`
     )
   }
 
@@ -844,6 +852,38 @@ export class AttachmentManager {
 
   /* ---------------- 下载 ---------------- */
 
+  /**
+   * 单跳请求。
+   * 默认用主进程会话（不带任何 Cookie，避免把账号数据泄露给任意站点）；
+   * 仅当服务端明确要求登录态（401/403）时，才用该账号视图所在 session
+   * （persist:doubao_<id>，含该分区里登录过的站点 Cookie）重试一次。
+   * 重定向仍由调用方逐跳处理，公网校验不受影响。
+   */
+  private async fetchHop(
+    current: URL,
+    accountId: string,
+    jobId: string,
+    signal: AbortSignal
+  ): Promise<Response> {
+    const res = await net.fetch(current.toString(), { signal, redirect: 'manual' })
+    if (res.status !== 401 && res.status !== 403) return res
+    this.dlog(
+      jobId,
+      accountId,
+      `[download] ${current.host} -> ${res.status}, retry with account session`
+    )
+    void res.body?.cancel().catch(() => {})
+    try {
+      const ses = session.fromPartition(`persist:doubao_${accountId}`)
+      const retry = await ses.fetch(current.toString(), { signal, redirect: 'manual' })
+      this.dlog(jobId, accountId, `[download] session retry -> ${retry.status}`)
+      return retry
+    } catch (e) {
+      this.dlog(jobId, accountId, `[download] session retry failed: ${errMsg(e)}`)
+      throw new Error(`该链接需要登录态，使用该账号登录信息重试也失败：${errMsg(e)}`)
+    }
+  }
+
   private async download(
     start: URL,
     accountId: string,
@@ -856,7 +896,7 @@ export class AttachmentManager {
     // 手动跟随重定向：每一跳都重新做公网校验，避免重定向到内网
     for (let i = 0; i <= MAX_REDIRECTS; i++) {
       await assertPublicHost(current.hostname)
-      res = await net.fetch(current.toString(), { signal, redirect: 'manual' })
+      res = await this.fetchHop(current, accountId, jobId, signal)
       if ([301, 302, 303, 307, 308].includes(res.status)) {
         const loc = res.headers.get('location')
         void res.body?.cancel().catch(() => {})
@@ -872,7 +912,18 @@ export class AttachmentManager {
 
     if (!res) throw new Error('请求失败')
     if ([301, 302, 303, 307, 308].includes(res.status)) throw new Error('重定向次数过多')
-    if (!res.ok) throw new Error(`服务器返回 ${res.status}${res.statusText ? ' ' + res.statusText : ''}`)
+    if (!res.ok) {
+      // 实机验证：nas.hnluchuan.com 的 /scenes-export 无 Cookie 时返回
+      // 401 {"detail":"未登录或登录已过期"}；HEAD 为 405，改 UA/Referer/Accept 均无效，
+      // 前端脚本也无 Authorization/localStorage token，说明鉴权完全依赖登录 Cookie。
+      // 上方的 fetchHop 已用账号 session 重试过一次，仍 401 即该会话里没有该站点登录态。
+      if (res.status === 401 || res.status === 403) {
+        throw new Error(
+          `该链接需要登录态（服务器返回 ${res.status}）：服务器要求该站点的登录 Cookie，当前账号会话中没有有效登录态`
+        )
+      }
+      throw new Error(`服务器返回 ${res.status}${res.statusText ? ' ' + res.statusText : ''}`)
+    }
     if (!res.body) throw new Error('服务器响应无内容')
 
     const mime = (res.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase()
