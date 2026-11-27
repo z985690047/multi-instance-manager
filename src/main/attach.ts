@@ -467,8 +467,12 @@ interface NewTaskState {
   flowMode: boolean
   /** 工作任务模式特征按钮（general-agent-*）可见数 */
   flowButtons: number
-  /** 普通对话模式特征按钮（skill_bar_button_*）可见数 */
-  skillButtons: number
+  /** 输入区工具条模式按钮（chat_input_action_mode）文案，工作任务模式显示「云电脑」 */
+  actionModeText: string
+  /** 输入区占位文案，用于小屏兜底识别工作任务模式 */
+  placeholder: string
+  /** 对话/工作切换器（conversation-mode-switch）是否停在「工作」档 */
+  workSwitchActive: boolean
   hasText: boolean
   hasAttachment: boolean
   href: string
@@ -502,14 +506,24 @@ const NEW_TASK_STATE = `(() => {
   // flowMode（general-agent-*），所以「是否新任务页」只能看 URL，不能看输入区特征。
   // flow_chat_guidance_page 在两种对话页的 DOM 里都存在，也不能作为判据。
   const flowButtons = countVisible('[data-testid="general-agent-plugin-button"], [data-testid="general-agent-skill-button"]');
-  const skillButtons = countVisible('[data-testid^="skill_bar_button_"]');
+  // 工具条模式按钮（云电脑）：testid 固定、小屏下也渲染（2026-11-27 实机验证）
+  const actionMode = document.querySelector('[data-testid="chat_input_action_mode"]');
+  const actionModeText = actionMode && visible(actionMode) ? (actionMode.textContent || '').replace(/\\s+/g, '') : '';
+  const placeholder = editor
+    ? (editor.getAttribute('data-placeholder') || (editor.querySelector('[data-placeholder]') && editor.querySelector('[data-placeholder]').getAttribute('data-placeholder')) || '')
+    : '';
+  // 对话/工作切换器：data-active 标记当前档位，小屏下也渲染（2026-11-27 实机验证）
+  const workSwitch = document.querySelector('[data-testid="conversation-mode-switch"] [data-active="true"]');
+  const workSwitchActive = !!workSwitch && (workSwitch.textContent || '').trim() === '工作';
   return {
     editorReady: !!editor && !!editor.isContentEditable && visible(editor),
     path: location.pathname,
     pathIsNew: path === '/chat',
     flowMode: flowButtons > 0,
     flowButtons,
-    skillButtons,
+    actionModeText,
+    placeholder,
+    workSwitchActive,
     hasText: !!(editor && (editor.textContent || '').trim().length),
     hasAttachment: !!document.querySelector('[data-testid="attachment_area"], [data-testid="attachment_file_item"]'),
     href: location.href
@@ -569,6 +583,9 @@ const DUMP_BUTTONS = `(() => {
 
 /** 点击「新工作任务」后等待任务页输入区就绪的超时 */
 const NEW_TASK_TIMEOUT = 10_000
+
+/** 快捷键触发后等待页面切换的超时；没生效就走点击兜底 */
+const SHORTCUT_TIMEOUT = 3_000
 
 export class AttachmentManager {
   private push: PushFn
@@ -630,14 +647,21 @@ export class AttachmentManager {
 
     const state = await evalState()
     if (state) this.dlog(jobId, accountId, `[new-task] state ${JSON.stringify(state)}`)
+    // 任务模式确认，按可靠度排序：general-agent-* 按钮（宽屏）> 工具条显示「云电脑」
+    // > 切换器停在「工作」> 占位文案含「创建任务」。后三者小屏下也成立（2026-11-27 实机验证）。
+    const isWorkComposer = (s: NewTaskState): boolean =>
+      s.flowMode ||
+      s.actionModeText.includes('云电脑') ||
+      s.workSwitchActive ||
+      s.placeholder.includes('创建任务')
     // 只有「新任务页（/chat，不带会话 id）+ 任务模式 + 编辑器就绪」才算已就绪。
     // 已有工作任务对话（/chat/<会话id>）同样是 flowMode，实机日志已证实：
     // 旧判据在这里直接 skip click，文件被注入了当前已有对话。
-    if (state && state.editorReady && state.flowMode && state.pathIsNew) {
+    if (state && state.editorReady && state.pathIsNew && isWorkComposer(state)) {
       this.dlog(jobId, accountId, '[new-task] already on new-task page in work-task mode, skip click')
       return
     }
-    if (state && state.flowMode && !state.pathIsNew) {
+    if (state && isWorkComposer(state) && !state.pathIsNew) {
       this.dlog(
         jobId,
         accountId,
@@ -652,6 +676,64 @@ export class AttachmentManager {
     if (state && (state.hasText || (state.hasAttachment && state.pathIsNew))) {
       throw new Error('未能切换到新工作任务：当前对话有未发送内容，请先发送或清空后再同步')
     }
+
+    let lastState: NewTaskState | null = state
+    // 统一等待：编辑器就绪 + 新任务页 URL + 任务模式特征（按钮或占位文案）
+    const waitReady = async (timeoutMs: number, via: string): Promise<boolean> => {
+      const deadline = Date.now() + timeoutMs
+      while (Date.now() < deadline) {
+        if (signal.aborted) throw new Error('已取消')
+        if (wc.isDestroyed()) throw new Error('账号页面已关闭，无法切换新工作任务')
+        await delay(200)
+        const s = await evalState()
+        if (s) lastState = s
+        if (s && s.editorReady && s.pathIsNew && isWorkComposer(s)) {
+          this.dlog(jobId, accountId, `[new-task] flow editor ready at ${s.path} via ${via}`)
+          return true
+        }
+      }
+      return false
+    }
+
+    // 优先页面快捷键（mac ⌘J / win Ctrl+J）：CDP 注入按键不依赖系统窗口焦点，
+    // 也不受侧栏布局与小屏折叠影响；点击只作兜底。modifier 位掩码 Ctrl=2、Meta=4。
+    const triggerShortcut = async (): Promise<boolean> => {
+      const useMeta = process.platform === 'darwin'
+      try {
+        wc.focus()
+      } catch {
+        // 渲染进程焦点失败不阻塞，CDP 按键通常仍会送达
+      }
+      const key = { key: 'j', code: 'KeyJ', windowsVirtualKeyCode: 74, modifiers: useMeta ? 4 : 2 }
+      const dbg = this.debuggerFor(wc)
+      if (dbg) {
+        try {
+          await dbg.sendCommand('Input.dispatchKeyEvent', { ...key, type: 'keyDown' })
+          await dbg.sendCommand('Input.dispatchKeyEvent', { ...key, type: 'keyUp' })
+          this.dlog(
+            jobId,
+            accountId,
+            `[new-task] shortcut dispatched via CDP (${useMeta ? 'Cmd' : 'Ctrl'}+J)`
+          )
+          return true
+        } catch (e) {
+          this.dlog(jobId, accountId, `[new-task] CDP shortcut error: ${errMsg(e)}`)
+        }
+      }
+      // CDP 不可用时退化 Electron 输入事件（同样注入渲染层，不依赖系统焦点）
+      try {
+        const mod: Array<'command' | 'control'> = [useMeta ? 'command' : 'control']
+        wc.sendInputEvent({ type: 'keyDown', keyCode: 'j', modifiers: mod })
+        wc.sendInputEvent({ type: 'keyUp', keyCode: 'j', modifiers: mod })
+        this.dlog(jobId, accountId, `[new-task] shortcut dispatched via sendInputEvent (${mod[0]}+J)`)
+        return true
+      } catch (e) {
+        this.dlog(jobId, accountId, `[new-task] sendInputEvent shortcut error: ${errMsg(e)}`)
+        return false
+      }
+    }
+    if ((await triggerShortcut()) && (await waitReady(SHORTCUT_TIMEOUT, 'shortcut'))) return
+    this.dlog(jobId, accountId, '[new-task] shortcut unavailable or no effect, fallback to click')
 
     let candidates: NewTaskCandidate[] = []
     try {
@@ -730,28 +812,22 @@ export class AttachmentManager {
       }
     }
 
-    const deadline = Date.now() + NEW_TASK_TIMEOUT
-    let lastState: NewTaskState | null = null
-    while (Date.now() < deadline) {
-      if (signal.aborted) throw new Error('已取消')
-      if (wc.isDestroyed()) throw new Error('账号页面已关闭，无法切换新工作任务')
-      await delay(200)
-      const s = await evalState()
-      if (s) lastState = s
-      // 编辑器就绪 + 任务模式 + URL 已经变成新任务页（/chat 且不带会话 id）。
-      // 普通对话页编辑器也一直 ready；已有对话页同样是 flowMode，
-      // 少判任何一个都会把「点击没生效」误判为切换成功。
-      if (s && s.editorReady && s.flowMode && s.pathIsNew) {
-        this.dlog(jobId, accountId, `[new-task] flow editor ready at ${s.path}`)
-        return
+    if (!(await waitReady(NEW_TASK_TIMEOUT, 'click'))) {
+      this.dlog(jobId, accountId, `[new-task] wait timeout, lastState=${JSON.stringify(lastState)}`)
+      // 超时时转储页面按钮，便于下次豆包改版时直接定位新特征
+      try {
+        const dump = await wc.executeJavaScript(DUMP_BUTTONS, false)
+        this.dlog(jobId, accountId, `[new-task] timeout button dump ${JSON.stringify(dump)}`)
+      } catch {
+        // ignore
       }
+      const s = lastState
+      throw new Error(
+        `未能切换到新工作任务：触发后未确认进入任务输入区（URL ${s?.path ?? '未知'}，flow按钮=${
+          s?.flowButtons ?? '-'
+        }，工具条="${s?.actionModeText ?? '-'}"，占位="${s?.placeholder ?? '-'}"；诊断日志：${this.logFile}）`
+      )
     }
-    this.dlog(jobId, accountId, `[new-task] wait timeout, lastState=${JSON.stringify(lastState)}`)
-    throw new Error(
-      `未能切换到新工作任务：点击后仍未进入新任务页（当前 ${
-        lastState ? lastState.path : '未知'
-      }，应为 /chat；诊断日志：${this.logFile}）`
-    )
   }
 
   /**
